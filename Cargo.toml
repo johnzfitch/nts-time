@@ -1,0 +1,30 @@
+[package]
+name = "nts-time"
+version = "0.1.0"
+edition = "2024"
+description = "Sets the Windows clock from several NTS-authenticated (RFC 8915) time servers"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/johnzfitch/nts-time"
+readme = "README.md"
+keywords = ["nts", "ntp", "time", "windows", "rfc8915"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
+
+[dependencies]
+# ntpd-rs protocol crate. Its API is internal and unstable, so the version is pinned exactly.
+ntp-proto = { version = "=1.9.0", features = ["__internal-api", "__internal-test"] }
+# __internal-test only adds accessors (SourceNtsData::get_cookie/get_keys) and test helpers; no behaviour change.
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1

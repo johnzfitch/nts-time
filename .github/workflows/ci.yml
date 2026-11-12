@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke test (dry run against the default NTS servers)
+        shell: pwsh
+        run: |
+          .\target\release\nts-time.exe --version
+          # GitHub-hosted runners may block outbound UDP 123, so a failure here is reported, not fatal.
+          .\target\release\nts-time.exe
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::dry run exited $LASTEXITCODE (network may be restricted on runners)" }
+          exit 0
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $dir = "nts-time-$v-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target\release\nts-time.exe, install.ps1, uninstall.ps1, README.md, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $files = @("$dir.zip", "target\release\nts-time.exe")
+          $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), (Split-Path $_ -Leaf) } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          "ZIP=$dir.zip" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nts-time-windows-x64
+          path: |
+            ${{ env.ZIP }}
+            SHA256SUMS.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nts-time-windows-x64
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "nts-time-*-windows-x64.zip"
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem nts-time-*-windows-x64.zip | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME $zip.FullName SHA256SUMS.txt --title "nts-time $env:GITHUB_REF_NAME" --generate-notes
