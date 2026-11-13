@@ -16,9 +16,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --release --locked
+
+      - name: Installer security tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\install-security.Tests.ps1
+
+      - name: Installer security tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\install-security.Tests.ps1
 
       - name: Build
         run: cargo build --release --locked
@@ -38,7 +54,7 @@ jobs:
           $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $dir = "nts-time-$v-windows-x64"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item target\release\nts-time.exe, install.ps1, uninstall.ps1, README.md, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY.md $dir
+          Copy-Item target\release\nts-time.exe, install.ps1, install-security.ps1, uninstall.ps1, README.md, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY.md $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $files = @("$dir.zip", "target\release\nts-time.exe")
           $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), (Split-Path $_ -Leaf) } |

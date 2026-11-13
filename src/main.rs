@@ -11,6 +11,7 @@
 
 mod clock;
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,7 +56,7 @@ fn usage() -> ! {
     std::process::exit(64)
 }
 
-fn parse_args() -> Config {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
     let mut c = Config {
         apply: false,
         servers: DEFAULT_SERVERS
@@ -69,38 +70,80 @@ fn parse_args() -> Config {
         max_slew_ppm: 500.0,
         log: None,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(a) = args.next() {
-        let mut val = || args.next().unwrap_or_else(|| usage());
+        let mut val = || args.next().ok_or_else(|| format!("missing value for {a}"));
         match a.as_str() {
             "--apply" => c.apply = true,
-            "--version" | "-V" => {
-                println!("nts-time {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0)
-            }
             "--servers" => {
-                c.servers = val()
+                c.servers = val()?
                     .split(',')
-                    .filter(|s| !s.is_empty())
                     .map(|s| match s.split_once('=') {
-                        Some((h, g)) => (h.to_string(), g.to_string()),
-                        None => (s.to_string(), s.to_string()),
+                        Some((h, g)) => {
+                            (h.trim().to_ascii_lowercase(), g.trim().to_ascii_lowercase())
+                        }
+                        None => (s.trim().to_ascii_lowercase(), s.trim().to_ascii_lowercase()),
                     })
                     .collect()
             }
-            "--samples" => c.samples = val().parse().unwrap_or_else(|_| usage()),
-            "--min-agree" => c.min_agree = val().parse().unwrap_or_else(|_| usage()),
-            "--max-offset" => c.max_offset = val().parse().unwrap_or_else(|_| usage()),
-            "--step-threshold" => c.step_threshold = val().parse().unwrap_or_else(|_| usage()),
-            "--max-slew-ppm" => c.max_slew_ppm = val().parse().unwrap_or_else(|_| usage()),
-            "--log" => c.log = Some(val()),
-            _ => usage(),
+            "--samples" => c.samples = number(&val()?, &a)?,
+            "--min-agree" => c.min_agree = number(&val()?, &a)?,
+            "--max-offset" => c.max_offset = number(&val()?, &a)?,
+            "--step-threshold" => c.step_threshold = number(&val()?, &a)?,
+            "--max-slew-ppm" => c.max_slew_ppm = number(&val()?, &a)?,
+            "--log" => c.log = Some(val()?),
+            _ => return Err(format!("unknown or combined diagnostic option: {a}")),
         }
     }
-    if c.samples == 0 || c.samples > 8 || c.min_agree == 0 || c.max_slew_ppm <= 0.0 {
-        usage();
+    if !(1..=8).contains(&c.samples) {
+        return Err("--samples must be between 1 and 8".into());
     }
-    c
+    if !c.max_offset.is_finite() || c.max_offset < 0.0 {
+        return Err("--max-offset must be finite and nonnegative".into());
+    }
+    clock::validate_settings(c.step_threshold, c.max_slew_ppm)?;
+    let mut hosts = HashSet::new();
+    let mut groups = HashSet::new();
+    for (host, group) in &mut c.servers {
+        *host = host.strip_suffix('.').unwrap_or(host).to_string();
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            *host = ip.to_string();
+        } else if host.is_empty()
+            || host.len() > 253
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err(format!("invalid server hostname: {host:?}"));
+        }
+        if group.is_empty()
+            || !group
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
+        {
+            return Err(format!("invalid operator group: {group:?}"));
+        }
+        if !hosts.insert(host.clone()) {
+            return Err(format!("duplicate server hostname: {host}"));
+        }
+        groups.insert(group.clone());
+    }
+    if c.min_agree == 0 || c.min_agree > groups.len() {
+        return Err("--min-agree must be between 1 and the number of configured operators".into());
+    }
+    Ok(c)
+}
+
+fn number<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid value for {flag}: {value:?}"))
 }
 
 #[derive(Serialize, Clone)]
@@ -130,13 +173,15 @@ struct ServerResult {
     error: Option<String>,
 }
 
-fn to_ntp(t: SystemTime) -> (NtpTimestamp, u128) {
-    let d = t.duration_since(UNIX_EPOCH).expect("clock before 1970");
+fn to_ntp(t: SystemTime) -> Result<(NtpTimestamp, u128), String> {
+    let d = t
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock before 1970")?;
     let secs = (d.as_secs() + NTP_UNIX_OFFSET) as u32; // era wrap is handled by NtpTimestamp subtraction
-    (
+    Ok((
         NtpTimestamp::from_seconds_nanos_since_ntp_era(secs, d.subsec_nanos()),
         d.as_nanos(),
-    )
+    ))
 }
 
 async fn query_server(ke: &KeyExchangeClient, host: &str, group: &str, n: usize) -> ServerResult {
@@ -163,10 +208,13 @@ async fn query_server(ke: &KeyExchangeClient, host: &str, group: &str, n: usize)
 
 async fn query_inner(ke: &KeyExchangeClient, r: &mut ServerResult, n: usize) -> Result<(), String> {
     let ke_start = Instant::now();
-    let tcp = timeout(Duration::from_secs(5), TcpStream::connect((r.host.as_str(), 4460)))
-        .await
-        .map_err(|_| "NTS-KE connect timed out".to_string())?
-        .map_err(|e| format!("NTS-KE connect: {e}"))?;
+    let tcp = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((r.host.as_str(), 4460)),
+    )
+    .await
+    .map_err(|_| "NTS-KE connect timed out".to_string())?
+    .map_err(|e| format!("NTS-KE connect: {e}"))?;
     let res = timeout(
         Duration::from_secs(10),
         ke.exchange_keys(tcp, r.host.clone(), std::iter::empty()),
@@ -183,21 +231,33 @@ async fn query_inner(ke: &KeyExchangeClient, r: &mut ServerResult, n: usize) -> 
     let c2s: Option<&dyn Cipher> = Some(c2s.as_ref());
     let s2c: Option<&dyn Cipher> = Some(s2c.as_ref());
 
-    let addr = lookup_host((res.remote.as_str(), res.port))
-        .await
-        .map_err(|e| format!("resolve {}: {e}", res.remote))?
-        .next()
-        .ok_or_else(|| format!("resolve {}: no address", res.remote))?;
+    let addr = timeout(
+        Duration::from_secs(5),
+        lookup_host((res.remote.as_str(), res.port)),
+    )
+    .await
+    .map_err(|_| format!("resolve {}: timed out", res.remote))?
+    .map_err(|e| format!("resolve {}: {e}", res.remote))?
+    .next()
+    .ok_or_else(|| format!("resolve {}: no address", res.remote))?;
     r.ntp_server = Some(format!("{}:{} ({addr})", res.remote, res.port));
-    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let sock = UdpSocket::bind(bind).await.map_err(|e| format!("bind: {e}"))?;
-    sock.connect(addr).await.map_err(|e| format!("connect udp: {e}"))?;
+    let bind = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("bind: {e}"))?;
+    sock.connect(addr)
+        .await
+        .map_err(|e| format!("connect udp: {e}"))?;
 
     for (i, cookie) in cookies.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        match one_sample(&sock, cookie, &c2s, &s2c).await {
+        match one_sample(&sock, cookie, &c2s, &s2c, Duration::from_secs(3)).await {
             Ok(s) => r.samples.push(s),
             Err(e) => r.sample_errors.push(e),
         }
@@ -213,6 +273,7 @@ async fn one_sample(
     cookie: &[u8],
     c2s: &Option<&dyn Cipher>,
     s2c: &Option<&dyn Cipher>,
+    response_timeout: Duration,
 ) -> Result<Sample, String> {
     // Ask for one replacement cookie; we do not keep them between runs anyway.
     let (packet, id) = NtpPacket::nts_poll_message(cookie, 1, PollInterval::from_byte(6));
@@ -223,25 +284,51 @@ async fn one_sample(
         .map_err(|e| format!("serialize: {e}"))?;
     let len = cur.position() as usize;
 
-    // Drain anything stale so a late reply to an earlier request is not mistaken for this one.
+    // Bound draining: a peer continuously sending datagrams must not prevent the request.
+    // Request identifiers below reject any stale packets left in the queue.
     let mut rbuf = [0u8; 2048];
-    while sock.try_recv(&mut rbuf).is_ok() {}
+    for _ in 0..32 {
+        if sock.try_recv(&mut rbuf).is_err() {
+            break;
+        }
+    }
 
     let t1 = SystemTime::now();
-    sock.send(&buf[..len]).await.map_err(|e| format!("send: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + response_timeout;
+    timeout(response_timeout, sock.send(&buf[..len]))
+        .await
+        .map_err(|_| "send timed out".to_string())?
+        .map_err(|e| format!("send: {e}"))?;
+    let mut last_rejection = None;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let n = timeout(left, sock.recv(&mut rbuf))
-            .await
-            .map_err(|_| "no response within 3 s".to_string())?
-            .map_err(|e| format!("recv: {e}"))?;
+        // timeout() alone is insufficient when recv() is continuously ready.
+        if left.is_zero() {
+            return Err(format!(
+                "no valid response before deadline; last rejection: {last_rejection:?}"
+            ));
+        }
+        let received = timeout(left, sock.recv(&mut rbuf)).await.map_err(|_| {
+            format!("no valid response before deadline; last rejection: {last_rejection:?}")
+        })?;
+        let n = match received {
+            Ok(n) => n,
+            // Windows reports WSAEMSGSIZE instead of returning a truncated UDP datagram.
+            Err(e) if e.raw_os_error() == Some(10040) => {
+                last_rejection = Some("oversized datagram".into());
+                continue;
+            }
+            Err(e) => return Err(format!("recv: {e}")),
+        };
         let t4 = SystemTime::now();
 
         // Fails if the NTS authenticator does not decrypt with our server-to-client key.
         let resp = match NtpPacket::deserialize(&rbuf[..n], s2c) {
             Ok((p, _)) => p,
-            Err(e) => return Err(format!("rejected packet: {e}")),
+            Err(e) => {
+                last_rejection = Some(format!("rejected packet: {e}"));
+                continue;
+            }
         };
         // Requires our unique identifier inside the authenticated part and our origin timestamp.
         if !resp.valid_server_response(id, true) {
@@ -263,8 +350,8 @@ async fn one_sample(
         if !(1..=15).contains(&stratum) {
             return Err(format!("bad stratum {stratum}"));
         }
-        let (t1n, t1_unix_ns) = to_ntp(t1);
-        let (t4n, _) = to_ntp(t4);
+        let (t1n, t1_unix_ns) = to_ntp(t1)?;
+        let (t4n, _) = to_ntp(t4)?;
         let t2 = resp.receive_timestamp();
         let t3 = resp.transmit_timestamp();
         let t2_rel = (t2 - t1n).to_seconds();
@@ -315,25 +402,39 @@ fn select(results: &[ServerResult], min_agree: usize) -> Selection {
             })
         })
         .collect();
-    let mut edges: Vec<(f64, i32)> = Vec::new();
-    for &(_, _, o, l) in &good {
-        edges.push((o - l, 1));
-        edges.push((o + l, -1));
+    let mut edges = Vec::new();
+    for (index, &(_, _, o, l)) in good.iter().enumerate() {
+        edges.push((o - l, true, index));
+        edges.push((o + l, false, index));
     }
     // starts before ends at equal positions so touching intervals count as overlapping
     edges.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
-    let (mut best, mut cur, mut point) = (0, 0, 0.0);
-    for &(x, d) in &edges {
-        cur += d;
-        if cur > best {
-            best = cur;
-            point = x;
+    let mut active = BTreeSet::new();
+    let mut group_counts = HashMap::new();
+    let mut best = (false, 0, 0);
+    let mut chosen = BTreeSet::new();
+    for &(_, start, index) in &edges {
+        let group = good[index].1;
+        if start {
+            active.insert(index);
+            *group_counts.entry(group).or_insert(0usize) += 1;
+        } else {
+            active.remove(&index);
+            let count = group_counts.get_mut(group).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                group_counts.remove(group);
+            }
+        }
+        let eligible = group_counts.len() >= min_agree && active.len() * 2 > good.len();
+        // An ineligible cluster must never hide a smaller qualifying overlap.
+        let score = (eligible, active.len(), group_counts.len());
+        if score > best {
+            best = score;
+            chosen = active.clone();
         }
     }
-    let chimers: Vec<_> = good
-        .iter()
-        .filter(|&&(_, _, o, l)| (o - l..=o + l).contains(&point))
-        .collect();
+    let chimers: Vec<_> = chosen.iter().map(|&index| &good[index]).collect();
     let mut groups: Vec<&str> = chimers.iter().map(|c| c.1).collect();
     groups.sort_unstable();
     groups.dedup();
@@ -341,7 +442,21 @@ fn select(results: &[ServerResult], min_agree: usize) -> Selection {
     offs.sort_by(f64::total_cmp);
     let median = (!offs.is_empty()).then(|| {
         let m = offs.len() / 2;
-        if offs.len() % 2 == 1 { offs[m] } else { (offs[m - 1] + offs[m]) / 2.0 }
+        let median = if offs.len() % 2 == 1 {
+            offs[m]
+        } else {
+            (offs[m - 1] + offs[m]) / 2.0
+        };
+        let low = chimers
+            .iter()
+            .map(|c| c.2 - c.3)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let high = chimers
+            .iter()
+            .map(|c| c.2 + c.3)
+            .fold(f64::INFINITY, f64::min);
+        // Agreement constrains the correction itself, not just which servers vote.
+        median.clamp(low, high)
     });
     let ok = groups.len() >= min_agree && chimers.len() * 2 > good.len();
     Selection {
@@ -349,7 +464,11 @@ fn select(results: &[ServerResult], min_agree: usize) -> Selection {
         groups_agreeing: groups.len(),
         offset: if ok { median } else { None },
         reason: if ok {
-            format!("{} of {} responding servers agree", chimers.len(), good.len())
+            format!(
+                "{} of {} responding servers agree",
+                chimers.len(),
+                good.len()
+            )
         } else {
             format!(
                 "not enough agreement: {} operator(s) agree, {} responded, need {} operators and a majority",
@@ -373,7 +492,12 @@ struct Run {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--slew-test") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!("nts-time {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.as_slice() == ["--slew-test"] {
         match clock::slew_test(10.0, 500.0) {
             Ok(t) => {
                 println!(
@@ -407,11 +531,17 @@ fn main() {
             }
         }
     }
-    let cfg = parse_args();
-    let started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
+    let cfg = parse_args(args).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        usage()
+    });
+    let started = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs_f64(),
+        Err(_) => {
+            eprintln!("error: system clock before 1970; set the approximate date first");
+            std::process::exit(1);
+        }
+    };
 
     if cfg.apply {
         // Undo any slew a previous run left behind if it was killed mid-correction.
@@ -438,7 +568,10 @@ fn main() {
     let (action, detail, code) = match selection.offset {
         None => ("refused: no agreement".to_string(), None, 2),
         Some(o) if o.abs() > cfg.max_offset => (
-            format!("refused: offset {o:.6} s exceeds --max-offset {}", cfg.max_offset),
+            format!(
+                "refused: offset {o:.6} s exceeds --max-offset {}",
+                cfg.max_offset
+            ),
             None,
             3,
         ),
@@ -487,7 +620,11 @@ fn main() {
         if let Some(dir) = std::path::Path::new(path).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             Ok(mut f) => {
                 let _ = writeln!(f, "{line}");
             }
@@ -584,5 +721,206 @@ mod tests {
             res("f", "f", Some(5.0), 0.01),
         ];
         assert_eq!(select(&r, 3).offset, None);
+    }
+
+    #[test]
+    fn correction_stays_inside_every_selected_interval() {
+        let r = [
+            res("near", "a", Some(0.0), 0.0),
+            res("far1", "b", Some(0.9), 2.0),
+            res("far2", "c", Some(1.0), 2.0),
+        ];
+        let selection = select(&r, 3);
+        let offset = selection.offset.expect("three operators overlap");
+        for server in &r {
+            let sample = server.best.as_ref().unwrap();
+            let radius = sample.delay / 2.0 + 0.002;
+            assert!((sample.offset - radius..=sample.offset + radius).contains(&offset));
+        }
+    }
+
+    #[test]
+    fn finds_eligible_overlap_instead_of_same_operator_cluster() {
+        let r = [
+            res("a1", "a", Some(0.0), 0.0),
+            res("a2", "a", Some(0.0), 0.0),
+            res("a3", "a", Some(0.0), 0.0),
+            res("bridge", "a", Some(0.5), 1.0),
+            res("b", "b", Some(1.0), 0.0),
+            res("c", "c", Some(1.0), 0.0),
+            res("d", "d", Some(1.0), 0.0),
+        ];
+        let selection = select(&r, 3);
+        assert!(selection.offset.is_some());
+        assert_eq!(selection.groups_agreeing, 4);
+    }
+
+    #[tokio::test]
+    async fn malformed_datagram_does_not_discard_later_authenticated_reply() {
+        let keys = ntp_proto::test_cookie();
+        let c2s: Option<&dyn Cipher> = Some(keys.c2s.as_ref());
+        let s2c: Option<&dyn Cipher> = Some(keys.s2c.as_ref());
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let reply = async {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let (mut packet, _) = NtpPacket::deserialize(&buf[..n], &c2s).unwrap();
+            packet.set_mode(NtpAssociationMode::Server);
+            packet.set_stratum(1);
+            packet.set_leap(NtpLeapIndicator::NoWarning);
+            packet.set_origin_timestamp(packet.transmit_timestamp());
+            let now = to_ntp(SystemTime::now()).unwrap().0;
+            packet.set_receive_timestamp(now);
+            packet.set_transmit_timestamp(now);
+            let mut response_buf = [0u8; 2048];
+            let mut response = Cursor::new(&mut response_buf[..]);
+            packet.serialize(&mut response, &s2c, None).unwrap();
+            let len = response.position() as usize;
+            server.send_to(b"not an NTP packet", peer).await.unwrap();
+            server.send_to(&[0; 4096], peer).await.unwrap();
+            let mut tampered = response_buf[..len].to_vec();
+            // Header modification invalidates the NTS tag; the matching identifier alone is insufficient.
+            tampered[1] = 2;
+            server.send_to(&tampered, peer).await.unwrap();
+            // Even a valid authenticator must echo this request's origin timestamp.
+            packet.set_origin_timestamp(NtpTimestamp::from_seconds_nanos_since_ntp_era(0, 0));
+            packet.set_stratum(3);
+            let mut wrong_origin_buf = [0u8; 2048];
+            let mut wrong_origin = Cursor::new(&mut wrong_origin_buf[..]);
+            packet.serialize(&mut wrong_origin, &s2c, None).unwrap();
+            let wrong_len = wrong_origin.position() as usize;
+            server
+                .send_to(&wrong_origin_buf[..wrong_len], peer)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            server.send_to(&response_buf[..len], peer).await.unwrap();
+        };
+        let (sample, ()) = tokio::join!(
+            one_sample(&client, &[0; 32], &c2s, &s2c, Duration::from_secs(3)),
+            reply
+        );
+        assert_eq!(sample.unwrap().stratum, 1);
+    }
+
+    #[test]
+    fn numeric_options_reject_nonfinite_and_unsafe_values() {
+        for flag in ["--max-offset", "--step-threshold", "--max-slew-ppm"] {
+            for value in ["NaN", "inf", "-inf", "1e999", "-1"] {
+                assert!(
+                    parse_args([flag.to_string(), value.to_string()]).is_err(),
+                    "{flag} {value}"
+                );
+            }
+        }
+        for value in ["0", "500.001", "1000000"] {
+            assert!(parse_args(["--max-slew-ppm".into(), value.into()]).is_err());
+        }
+        assert!(
+            parse_args([
+                "--max-offset".into(),
+                "0".into(),
+                "--step-threshold".into(),
+                "0".into()
+            ])
+            .is_ok()
+        );
+        assert!(parse_args(["--max-slew-ppm".into(), "0.001".into()]).is_ok());
+    }
+
+    #[test]
+    fn invalid_server_lists_and_quorums_are_rejected() {
+        for servers in [
+            "",
+            ",",
+            "a=",
+            "=a",
+            "a=x,,b=y",
+            "a=x,",
+            "a=x,a=y",
+            "EXAMPLE.com=x,example.com.=y",
+            "a...=x",
+            "a=foo bar",
+            "a\"=x",
+            "a=x\" --log file",
+        ] {
+            assert!(
+                parse_args([
+                    "--min-agree".into(),
+                    "1".into(),
+                    "--servers".into(),
+                    servers.into()
+                ])
+                .is_err(),
+                "{servers:?}"
+            );
+        }
+        assert!(parse_args(["--servers".into(), "a=x,b=x,c=y".into()]).is_err());
+        for value in ["0", "6"] {
+            assert!(parse_args(["--min-agree".into(), value.into()]).is_err());
+        }
+        for value in ["0", "9"] {
+            assert!(parse_args(["--samples".into(), value.into()]).is_err());
+        }
+    }
+
+    #[test]
+    fn server_names_and_operator_groups_are_normalized() {
+        let c = parse_args(["--servers".into(), "A.Example.=ONE, b=Two,::1=THREE".into()]).unwrap();
+        assert_eq!(
+            c.servers,
+            vec![
+                ("a.example".into(), "one".into()),
+                ("b".into(), "two".into()),
+                ("::1".into(), "three".into())
+            ]
+        );
+        assert!(parse_args(["--servers".into(), "a=X,b=x,c=y".into()]).is_err());
+    }
+
+    #[test]
+    fn diagnostic_options_cannot_be_combined_with_normal_run_flags() {
+        assert!(parse_args(["--slew-test".into(), "--version".into()]).is_err());
+        assert!(parse_args(["--apply".into(), "--slew-test".into()]).is_err());
+        assert!(parse_args(["--samples".into()]).is_err());
+    }
+
+    #[test]
+    fn ntp_conversion_handles_era_wrap_and_rejects_pre_epoch_time() {
+        assert!(to_ntp(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        let wrap = UNIX_EPOCH + Duration::from_secs((1u64 << 32) - NTP_UNIX_OFFSET);
+        let (before, _) = to_ntp(wrap - Duration::from_secs(1)).unwrap();
+        let (after, _) = to_ntp(wrap + Duration::from_secs(1)).unwrap();
+        // ntp-proto's fixed-point conversion is accurate to one NTP fractional unit.
+        assert!(((after - before).to_seconds() - 2.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn invalid_traffic_cannot_extend_the_response_deadline() {
+        let keys = ntp_proto::test_cookie();
+        let c2s: Option<&dyn Cipher> = Some(keys.c2s.as_ref());
+        let s2c: Option<&dyn Cipher> = Some(keys.s2c.as_ref());
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let flood = async {
+            loop {
+                server.send_to(b"bad packet", peer).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        };
+        let sample = one_sample(&client, &[0; 32], &c2s, &s2c, Duration::from_millis(20));
+        let result = timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = sample => result,
+                () = flood => unreachable!(),
+            }
+        })
+        .await
+        .expect("invalid traffic kept the request alive");
+        assert!(result.err().unwrap().contains("deadline"));
     }
 }
