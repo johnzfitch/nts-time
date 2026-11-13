@@ -1,3 +1,4 @@
+![nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
 [ci-badge]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml/badge.svg
 [ci]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml
 [releases]: https://github.com/johnzfitch/nts-time/releases/latest
