@@ -110,6 +110,8 @@ Everything it touches is listed here, and `uninstall.ps1` reverses all of it.
 
 Your original W32Time settings are saved once, to `%ProgramData%\nts-time\w32time-backup.json`, before anything changes. A reinstall never overwrites that backup.
 
+The installer checks existing program/data directories, logs, and backups before writing to them. It refuses reparse points (including junctions and symbolic links), untrusted owners, and files or directories writable by untrusted principals. Existing SYSTEM, Administrators, and Windows TrustedInstaller permissions are trusted. Installed directories receive a protected ACL granting SYSTEM and Administrators full access and Users read/execute access. Keep `install-security.ps1` next to `install.ps1`; both are included in release archives.
+
 > [!WARNING]
 > Turning <mark>Settings &rarr; Time &amp; language &rarr; Set time automatically</mark> back **on** switches W32Time back to plain NTP. It will then fight nts-time over the clock. Leave it off, or run `uninstall.ps1` first.
 
@@ -133,17 +135,17 @@ sequenceDiagram
     Note over T: keep lowest-delay sample per server, intersect all servers, step or slew
 ```
 
-Each run is one shot: it queries every server, decides, corrects, and exits. The protocol work (NTS-KE, cookies, `AEAD_AES_SIV_CMAC`, packet parsing and response validation) comes from [`ntp-proto`][ntp-proto], the library behind [ntpd-rs][ntpd-rs]. It's pinned to an exact version because its API is internal. The rest is about 870 lines, tests included, in [`src/`](src): server selection, clock control and logging.
+Each run is one shot: it queries every server, decides, corrects, and exits. The protocol work (NTS-KE, cookies, `AEAD_AES_SIV_CMAC`, packet parsing and response validation) comes from [`ntp-proto`][ntp-proto], the library behind [ntpd-rs][ntpd-rs]. It's pinned to an exact version because its API is internal. The application code in [`src/`](src) handles server selection, clock control and logging.
 
 ### The rules it won't bend
 
 <dl>
   <dt>&#x1F512;&ensp;Authenticated or nothing</dt>
-  <dd>A reply is dropped if its NTS authenticator doesn't decrypt, if our unique identifier and origin timestamp aren't echoed inside the authenticated part, if it's a kiss-o&rsquo;-death, if the server says it's unsynchronised, or if its root distance is over 1&nbsp;s. Cookies are never reused.</dd>
+  <dd>A reply is dropped if its NTS authenticator doesn't decrypt, if our unique identifier and origin timestamp aren't echoed inside the authenticated part, if it's a kiss-o&rsquo;-death, if the server says it's unsynchronised, or if its root distance is over 1&nbsp;s. Malformed and oversized packets do not prevent a later valid reply from being accepted within the same fixed deadline. Cookies are never reused.</dd>
   <dt>&#x2696;&#xFE0F;&ensp;Independent agreement</dt>
-  <dd>Each server's lowest-delay sample becomes an interval <var>offset</var>&nbsp;&plusmn;&nbsp;(<var>delay</var>/2&nbsp;+&nbsp;<var>root&nbsp;delay</var>/2&nbsp;+&nbsp;<var>root&nbsp;dispersion</var>&nbsp;+&nbsp;2&nbsp;ms). The clock moves only if intervals from at least <b>3 distinct operators</b>, and a <b>majority</b> of the servers that responded, overlap. One lying or broken server can't move your clock.</dd>
+  <dd>Each server's lowest-delay sample becomes an interval <var>offset</var>&nbsp;&plusmn;&nbsp;(<var>delay</var>/2&nbsp;+&nbsp;<var>root&nbsp;delay</var>/2&nbsp;+&nbsp;<var>root&nbsp;dispersion</var>&nbsp;+&nbsp;2&nbsp;ms). With the default <code>--min-agree 3</code>, the clock moves only if intervals from at least <b>3 distinct operators</b>, and a <b>majority</b> of the servers that responded, overlap. Selection considers the operator requirement while finding an overlap, then clamps the median correction to the intersection of every selected interval. Lowering <code>--min-agree</code> explicitly weakens the operator requirement.</dd>
   <dt>&#x1F4CF;&ensp;Bounded corrections</dt>
-  <dd>Offsets over 1&nbsp;day are refused. Offsets of 128&nbsp;ms or more are <dfn>stepped</dfn>. Smaller ones are <dfn>slewed</dfn> at 500&nbsp;ppm, so time never runs backwards for small errors. Every slew is measured against the hardware performance counter. If it misses by more than half, the remainder is stepped and the run is flagged.</dd>
+  <dd>By default, offsets over 1&nbsp;day are refused and offsets of 128&nbsp;ms or more are <dfn>stepped</dfn>. Smaller ones are <dfn>slewed</dfn> at 500&nbsp;ppm. Numeric settings must be finite, and the slew rate cannot exceed 500&nbsp;ppm. A slew that would take longer than five minutes, or whose rate cannot be represented, falls back to a step. Every slew is measured against the hardware performance counter. If it misses by more than half, the remainder is stepped and the run is flagged.</dd>
   <dt>&#x1F9F9;&ensp;No leftovers</dt>
   <dd>Every run starts by resetting the clock rate to nominal, so a run killed mid-slew can't leave the clock running fast or slow.</dd>
 </dl>
@@ -164,6 +166,8 @@ Far-away servers add path asymmetry, typically a few milliseconds. The interval 
 .\install.ps1 -Servers "time.cloudflare.com=cloudflare,ohio.time.system76.com=system76,nts.netnod.se=netnod,ptbtime2.ptb.de=ptb"
 ```
 
+Hostnames and operator names are case-insensitive. Empty entries, duplicate hostnames (including case/trailing-dot variants), and impossible operator quorums are rejected before network access or clock changes. Operator names must use letters, digits, `.`, `_`, `-`, or `:`. Assign operator groups accurately: the client cannot determine whether different DNS names belong to the same operator.
+
 ---
 
 Reference
@@ -181,7 +185,7 @@ Reference
 | `--min-agree N` | `3` | Distinct operators that must agree |
 | `--max-offset SECS` | `86400` | Refuse corrections larger than this |
 | `--step-threshold SECS` | `0.128` | Step at or above this, slew below |
-| `--max-slew-ppm PPM` | `500` | Slew rate |
+| `--max-slew-ppm PPM` | `500` | Finite slew rate, greater than 0 and at most 500; slews over five minutes fall back to a step |
 | `--log FILE` | none | Append one JSON line per run (every sample, the selection, the action) |
 | `--slew-test` | | Diagnostic: runs 0, +500, &minus;500, 0&nbsp;ppm for 10&nbsp;s each and prints the drift actually measured. Needs admin, and moves the clock by &lt;&nbsp;5&nbsp;ms |
 | `--version` | | Print version |
@@ -189,6 +193,8 @@ Reference
 Exit codes: <samp>0</samp> ok &middot; <samp>1</samp> error &middot; <samp>2</samp> servers didn't agree, clock untouched &middot; <samp>3</samp> offset over `--max-offset`, clock untouched &middot; <samp>64</samp> bad arguments.
 
 `install.ps1` takes `-Servers`, `-IntervalMinutes` (default 15) and `-DryRun`.
+
+Use `--version` and `--slew-test` on their own. Combining a diagnostic option with other flags is rejected, so a command such as `--slew-test --version` cannot accidentally move the clock.
 
 </details>
 

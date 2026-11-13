@@ -40,6 +40,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,6 +384,7 @@ checksum = "f73f4f1d273d1cd34c8d821c2767c949d415b91935948f97166ba27cf6628ac0"
 dependencies = [
  "aead",
  "aes-siv",
+ "arbitrary",
  "md-5",
  "rand",
  "rustls",

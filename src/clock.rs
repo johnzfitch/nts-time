@@ -19,6 +19,17 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 
 const UNIX_TO_FILETIME_100NS: i128 = 116_444_736_000_000_000;
+const MAX_SLEW_SECONDS: f64 = 300.0;
+
+pub fn validate_settings(step_threshold: f64, max_slew_ppm: f64) -> Result<(), String> {
+    if !step_threshold.is_finite() || step_threshold < 0.0 {
+        return Err("--step-threshold must be finite and nonnegative".into());
+    }
+    if !max_slew_ppm.is_finite() || max_slew_ppm <= 0.0 || max_slew_ppm > 500.0 {
+        return Err("--max-slew-ppm must be finite, greater than zero, and at most 500".into());
+    }
+    Ok(())
+}
 
 #[derive(Serialize)]
 pub struct ActionReport {
@@ -69,12 +80,15 @@ fn enable_systemtime_privilege() -> Result<(), String> {
             return Err(last_error("OpenProcessToken"));
         }
         let name: Vec<u16> = "SeSystemtimePrivilege\0".encode_utf16().collect();
-        let mut luid = LUID { LowPart: 0, HighPart: 0 };
+        let mut luid = LUID {
+            LowPart: 0,
+            HighPart: 0,
+        };
         if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) == FALSE {
             CloseHandle(token);
             return Err(last_error("LookupPrivilegeValueW"));
         }
-        let mut tp = TOKEN_PRIVILEGES {
+        let tp = TOKEN_PRIVILEGES {
             PrivilegeCount: 1,
             Privileges: [windows_sys::Win32::Security::LUID_AND_ATTRIBUTES {
                 Luid: luid,
@@ -84,7 +98,7 @@ fn enable_systemtime_privilege() -> Result<(), String> {
         let ok = AdjustTokenPrivileges(
             token,
             FALSE,
-            &mut tp,
+            &tp,
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -134,11 +148,44 @@ fn sys_secs(t: SystemTime) -> f64 {
 /// the clock runs SLOWER. Measured with --slew-test on Windows 11 26200 (2026-11-12): inc+5000
 /// gave -5.0 ms over 10 s, inc-5000 gave +5.0 ms. WINtp (github.com/lalakii/WINtp) uses the same
 /// sign. Do not go by the legacy SetSystemTimeAdjustment "added per interrupt" wording.
-fn adjustment_for(inc: u64, delta: u64, faster: bool) -> u64 {
-    if faster { inc - delta } else { inc + delta }
+fn adjustment_for(inc: u64, delta: u64, faster: bool) -> Option<u64> {
+    if delta >= inc {
+        return None;
+    }
+    if faster {
+        inc.checked_sub(delta)
+    } else {
+        inc.checked_add(delta)
+    }
 }
 
-pub fn correct(offset: f64, step_threshold: f64, max_slew_ppm: f64) -> Result<ActionReport, String> {
+fn slew_plan(inc: u64, offset: f64, ppm: f64) -> Option<(u64, f64, Duration)> {
+    if !offset.is_finite() || validate_settings(0.0, ppm).is_err() {
+        return None;
+    }
+    let delta = (inc as f64 * ppm * 1e-6).round() as u64;
+    if delta == 0 {
+        return None;
+    }
+    let adjustment = adjustment_for(inc, delta, offset > 0.0)?;
+    let rate = delta as f64 / inc as f64;
+    let seconds = offset.abs() / rate;
+    if !seconds.is_finite() || seconds > MAX_SLEW_SECONDS {
+        return None;
+    }
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    Some((adjustment, rate, duration))
+}
+
+pub fn correct(
+    offset: f64,
+    step_threshold: f64,
+    max_slew_ppm: f64,
+) -> Result<ActionReport, String> {
+    validate_settings(step_threshold, max_slew_ppm)?;
+    if !offset.is_finite() {
+        return Err("clock offset must be finite".into());
+    }
     if offset.abs() >= step_threshold {
         return step(offset);
     }
@@ -146,21 +193,17 @@ pub fn correct(offset: f64, step_threshold: f64, max_slew_ppm: f64) -> Result<Ac
     if unsafe { GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled) } == FALSE {
         return Err(last_error("GetSystemTimeAdjustmentPrecise"));
     }
-    let delta = (inc as f64 * max_slew_ppm * 1e-6).round() as u64;
-    if delta == 0 || inc == 0 {
-        return step(offset); // rate too fine to express: fall back to a step
-    }
-    let rate = delta as f64 / inc as f64;
-    let seconds = offset.abs() / rate;
-    // offset > 0 means the local clock is behind, so it must run fast.
-    let new_adj = adjustment_for(inc, delta, offset > 0.0);
+    let Some((new_adj, rate, duration)) = slew_plan(inc, offset, max_slew_ppm) else {
+        return step(offset); // unrepresentable rate or over five minutes: use a bounded step
+    };
+    let seconds = duration.as_secs_f64();
 
     let _guard = ResetOnDrop;
     let (s0, i0) = (SystemTime::now(), Instant::now());
     if unsafe { SetSystemTimeAdjustmentPrecise(new_adj, FALSE) } == FALSE {
         return Err(last_error("SetSystemTimeAdjustmentPrecise"));
     }
-    std::thread::sleep(Duration::from_secs_f64(seconds));
+    std::thread::sleep(duration);
     reset_adjustment()?;
     let (s1, i1) = (SystemTime::now(), Instant::now());
     let achieved = (sys_secs(s1) - sys_secs(s0)) - (i1 - i0).as_secs_f64();
@@ -208,6 +251,10 @@ pub struct SlewTest {
 
 /// Diagnostic: run 0, +ppm, -ppm, 0 for `secs` each and measure how system time moves against QPC.
 pub fn slew_test(secs: f64, ppm: f64) -> Result<SlewTest, String> {
+    validate_settings(0.0, ppm)?;
+    if !secs.is_finite() || secs <= 0.0 || secs > MAX_SLEW_SECONDS {
+        return Err("diagnostic duration must be between 0 and 300 seconds".into());
+    }
     enable_systemtime_privilege()?;
     let (mut adj, mut inc, mut disabled) = (0u64, 0u64, 0);
     if unsafe { GetSystemTimeAdjustmentPrecise(&mut adj, &mut inc, &mut disabled) } == FALSE {
@@ -219,7 +266,11 @@ pub fn slew_test(secs: f64, ppm: f64) -> Result<SlewTest, String> {
     let mut phases = Vec::new();
     // sign +1 = clock should run fast (+ppm), via the same mapping `correct` uses.
     for (sign, label) in [(0i64, 0.0), (1, ppm), (-1, -ppm), (0, 0.0)] {
-        let new_adj = if sign == 0 { inc } else { adjustment_for(inc, delta, sign > 0) };
+        let new_adj = if sign == 0 {
+            inc
+        } else {
+            adjustment_for(inc, delta, sign > 0).ok_or("unrepresentable clock adjustment")?
+        };
         let (s0, i0) = (SystemTime::now(), Instant::now());
         if sign != 0 && unsafe { SetSystemTimeAdjustmentPrecise(new_adj, FALSE) } == FALSE {
             return Err(last_error("SetSystemTimeAdjustmentPrecise"));
@@ -260,8 +311,7 @@ fn step(offset: f64) -> Result<ActionReport, String> {
         Err(_) => return Err("system clock before 1970".into()),
     };
     // SetSystemTime has millisecond resolution; round to the nearest millisecond.
-    let target = now_100ns + UNIX_TO_FILETIME_100NS + (offset * 1e7).round() as i128 + 5_000;
-    let target = target - target.rem_euclid(10_000);
+    let target = step_target(now_100ns, offset)?;
     let ft = FILETIME {
         dwLowDateTime: target as u32,
         dwHighDateTime: (target >> 32) as u32,
@@ -282,4 +332,73 @@ fn step(offset: f64) -> Result<ActionReport, String> {
         slew_seconds: None,
         time_increment_100ns: None,
     })
+}
+
+fn step_target(now_100ns: i128, offset: f64) -> Result<u64, String> {
+    if !offset.is_finite() {
+        return Err("clock offset must be finite".into());
+    }
+    let target = now_100ns
+        .checked_add(UNIX_TO_FILETIME_100NS)
+        .and_then(|t| t.checked_add((offset * 1e7).round() as i128))
+        .and_then(|t| t.checked_add(5_000))
+        .ok_or("clock target overflow")?;
+    if !(0..=i64::MAX as i128).contains(&target) {
+        return Err("clock target is outside the Windows FILETIME range".into());
+    }
+    let target = target - target.rem_euclid(10_000);
+    Ok(target as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slew_plan_preserves_direction_and_default_duration() {
+        let (fast, rate, duration) = slew_plan(10_000_000, 0.1, 500.0).unwrap();
+        assert_eq!(fast, 9_995_000);
+        assert_eq!(rate, 0.0005);
+        assert_eq!(duration, Duration::from_secs(200));
+        assert_eq!(slew_plan(10_000_000, -0.1, 500.0).unwrap().0, 10_005_000);
+    }
+
+    #[test]
+    fn unrepresentable_and_overlong_slews_fall_back_to_steps() {
+        for (inc, offset, ppm) in [
+            (0, 0.1, 500.0),
+            (1, 0.1, 500.0),
+            (10_000_000, 0.1, 0.001),
+            (10_000_000, 1.0, 500.0),
+            (10_000_000, f64::NAN, 500.0),
+            (10_000_000, 0.1, f64::INFINITY),
+            (10_000_000, 0.1, 1_000_000.0),
+        ] {
+            assert!(slew_plan(inc, offset, ppm).is_none());
+        }
+        assert_eq!(adjustment_for(10, 10, true), None);
+        assert_eq!(adjustment_for(10, 11, true), None);
+        assert_eq!(adjustment_for(u64::MAX, 1, false), None);
+    }
+
+    #[test]
+    fn step_targets_are_checked_before_narrowing_to_filetime() {
+        assert_eq!(step_target(0, 0.0).unwrap(), UNIX_TO_FILETIME_100NS as u64);
+        assert_eq!(
+            step_target(0, 0.0016).unwrap(),
+            UNIX_TO_FILETIME_100NS as u64 + 20_000
+        );
+        for offset in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            -20_000_000_000.0,
+        ] {
+            assert!(step_target(0, offset).is_err());
+        }
+        assert!(step_target(i128::MAX, 1.0).is_err());
+        assert!(step_target(i128::MIN, 0.0).is_err());
+    }
 }
