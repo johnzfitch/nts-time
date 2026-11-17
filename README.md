@@ -1,15 +1,11 @@
 ![nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
 
-[![CI][ci-badge]][ci]
-[![Release][release-badge]][releases]
-[![License][license-badge]](#license)
-
 nts-time
 ========
 
 **Authenticated time for Windows.** Your PC's clock syncs over plain <abbr title="Network Time Protocol">NTP</abbr>, which anyone on the network path can spoof. nts-time switches it to <abbr title="Network Time Security">NTS</abbr> ([RFC&nbsp;8915][rfc8915]), so every time reply is cryptographically tied to a TLS-verified server.
 
-[![CI][ci-badge]][ci] [![Release][release-badge]][releases] ![License][license-badge]
+[![CI][ci-badge]][ci] [![Release][release-badge]][releases] [![License][license-badge]](#license)
 
 > [!NOTE]
 > Windows' built-in time service (W32Time) has no NTS support, and the well-known NTS clients (chrony, NTPsec, ntpd-rs) don't run on Windows. nts-time fills that gap with one small `.exe` and a scheduled task. No background service, no driver, no installer framework.
@@ -269,7 +265,6 @@ Free for anyone to use, modify and redistribute, under either of [MIT](LICENSE-M
 
 [^sts]: [Secure Time Seeding][sts] lets W32Time set the clock from timestamps in TLS handshakes. Those timestamps aren't authenticated time, and STS has been known to set clocks wildly wrong. Leaving it on would give the network an unauthenticated way to move the clock around NTS.
 
-[nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
 [ci-badge]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml/badge.svg
 [ci]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml
 [releases]: https://github.com/johnzfitch/nts-time/releases/latest
