@@ -1,14 +1,8 @@
-[nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
-[ci-badge]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml/badge.svg
-[ci]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml
-[releases]: https://github.com/johnzfitch/nts-time/releases/latest
-[release-badge]: https://img.shields.io/github/v/release/johnzfitch/nts-time?label=release
-[license-badge]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue
-[rfc8915]: https://www.rfc-editor.org/rfc/rfc8915
-[ntpd-rs]: https://github.com/pendulum-project/ntpd-rs
-[ntp-proto]: https://crates.io/crates/ntp-proto
-[sts]: https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings
-[precise]: https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-setsystemtimeadjustmentprecise
+![nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
+
+[![CI][ci-badge]][ci]
+[![Release][release-badge]][releases]
+[![License][license-badge]](#license)
 
 nts-time
 ========
@@ -274,3 +268,15 @@ License
 Free for anyone to use, modify and redistribute, under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. The bundled crates keep their own permissive licenses; see [THIRD-PARTY.md](THIRD-PARTY.md).
 
 [^sts]: [Secure Time Seeding][sts] lets W32Time set the clock from timestamps in TLS handshakes. Those timestamps aren't authenticated time, and STS has been known to set clocks wildly wrong. Leaving it on would give the network an unauthenticated way to move the clock around NTS.
+
+[nts-time — Authenticated time for Windows](assets/nts-time-graphite-banner.png)
+[ci-badge]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml/badge.svg
+[ci]: https://github.com/johnzfitch/nts-time/actions/workflows/ci.yml
+[releases]: https://github.com/johnzfitch/nts-time/releases/latest
+[release-badge]: https://img.shields.io/github/v/release/johnzfitch/nts-time?label=release
+[license-badge]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue
+[rfc8915]: https://www.rfc-editor.org/rfc/rfc8915
+[ntpd-rs]: https://github.com/pendulum-project/ntpd-rs
+[ntp-proto]: https://crates.io/crates/ntp-proto
+[sts]: https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings
+[precise]: https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-setsystemtimeadjustmentprecise
