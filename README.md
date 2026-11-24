@@ -38,13 +38,16 @@ Get-ChildItem | Unblock-File
 You should see something like this:
 
 ```text
-time.cloudflare.com          offset -0.844585 s  delay 0.004601 s  stratum 3  (4 of 4 samples ok)
-nts.netnod.se                offset -0.848586 s  delay 0.164270 s  stratum 1  (4 of 4 samples ok)
-ptbtime1.ptb.de              offset -0.842812 s  delay 0.160639 s  stratum 1  (4 of 4 samples ok)
-nts.time.nl                  offset -0.843683 s  delay 0.144256 s  stratum 1  (4 of 4 samples ok)
-virginia.time.system76.com   offset -0.843419 s  delay 0.074018 s  stratum 2  (4 of 4 samples ok)
-agreeing: time.cloudflare.com, nts.netnod.se, ptbtime1.ptb.de, nts.time.nl, virginia.time.system76.com -> 5 of 5 responding servers agree
-dry run: would correct -0.843683 s
+time.cloudflare.com          offset -0.004260 s  delay 0.003396 s  stratum 3  (4 of 4 samples ok)
+nts.netnod.se                offset -0.009442 s  delay 0.164931 s  stratum 1  (4 of 4 samples ok)
+ptbtime1.ptb.de              offset -0.003322 s  delay 0.160431 s  stratum 1  (4 of 4 samples ok)
+nts.time.nl                  offset -0.003960 s  delay 0.143599 s  stratum 1  (4 of 4 samples ok)
+virginia.time.system76.com   offset -0.003572 s  delay 0.074031 s  stratum 2  (4 of 4 samples ok)
+nts.meta.com                 offset -0.004456 s  delay 0.002781 s  stratum 1  (4 of 4 samples ok)
+ntp1.wiktel.com              offset -0.006065 s  delay 0.058531 s  stratum 1  (4 of 4 samples ok)
+time1.mbix.ca                offset -0.004447 s  delay 0.050156 s  stratum 1  (4 of 4 samples ok)
+agreeing: time.cloudflare.com, nts.netnod.se, ptbtime1.ptb.de, nts.time.nl, virginia.time.system76.com, nts.meta.com, ntp1.wiktel.com, time1.mbix.ca -> 8 of 8 responding servers agree
+dry run: would correct -0.004354 s
 ```
 
 Then the install steps the clock and prints <samp>action: stepped clock by -0.847376 s (measured -0.847048 s)</samp>. That's it. It now re-syncs at boot and every 15&nbsp;minutes.
@@ -149,6 +152,11 @@ Each run is one shot: it queries every server, decides, corrects, and exits. The
 | `ptbtime1.ptb.de` | PTB | German national metrology institute, stratum&nbsp;1 |
 | `nts.time.nl` | SIDN Labs | Netherlands, stratum&nbsp;1 |
 | `virginia.time.system76.com` | System76 | US East |
+| `nts.meta.com` | Meta | anycast, stratum&nbsp;1 |
+| `ntp1.wiktel.com` | Wikstrom Telephone Company | US, stratum&nbsp;1 |
+| `time1.mbix.ca` | Manitoba Internet Exchange | Canada, stratum&nbsp;1 |
+
+Sonic's `time.sonic.net` servers aren't included: they serve plain NTP only, with no NTS-KE on TCP&nbsp;4460. More NTS servers are listed at [jauderho/nts-servers](https://github.com/jauderho/nts-servers), which doesn't vouch for them, so check any you add.
 
 Far-away servers add path asymmetry, typically a few milliseconds. The interval intersection accounts for that by widening each interval by half the round-trip delay. To use closer servers, pass `host=operator` pairs. Servers with the same operator count once toward the 3-operator rule:
 
