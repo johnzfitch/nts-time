@@ -28,3 +28,7 @@ windows-sys = { version = "0.59", features = [
 [profile.release]
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+# Exposes deterministic key fixtures for local authenticated-packet regression tests only.
+ntp-proto = { version = "=1.9.0", features = ["__internal-fuzz"] }

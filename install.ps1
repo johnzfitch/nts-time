@@ -21,6 +21,7 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'install-security.ps1')
 
 # The exe sits next to this script in a release zip, or under target\release in a source checkout.
 $src = @(
@@ -48,7 +49,15 @@ $w32Tasks  = '\Microsoft\Windows\Time Synchronization\'
 $taskPath  = '\nts-time\'
 $taskName  = 'Sync'
 
-New-Item -ItemType Directory -Force $binDir, $dataDir | Out-Null
+# Validate existing contents before changing parent ACLs: propagation must not hide
+# previously writable files (or writable handles that were opened before installation).
+Assert-TrustedInstallItem -Path $binDir -Directory
+Assert-TrustedInstallItem -Path $dataDir -Directory
+foreach ($path in @($exe, $log, $backup, (Join-Path $dataDir 'install.log'))) {
+    Assert-TrustedInstallItem -Path $path
+}
+Initialize-ProtectedInstallDirectory -Path $binDir
+Initialize-ProtectedInstallDirectory -Path $dataDir
 Start-Transcript -Append -Path (Join-Path $dataDir 'install.log') | Out-Null
 try {
     # Check the servers are reachable and agree before changing anything.
@@ -56,11 +65,10 @@ try {
     & $src @extra
     if ($LASTEXITCODE -ne 0) { throw "nts-time dry run failed with exit code $LASTEXITCODE; nothing was changed" }
 
-    # Binary under Program Files (admin-only write); data dir writable only by SYSTEM/Administrators.
+    # Both destination directories and existing files were checked before any writes.
     $running = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue
     if ($running -and $running.State -eq 'Running') { Stop-ScheduledTask -TaskPath $taskPath -TaskName $taskName }
     Copy-Item $src $exe -Force
-    icacls $dataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
     Write-Host "installed $exe  sha256 $((Get-FileHash $exe -Algorithm SHA256).Hash)"
 
     # Save the original W32Time settings once, so a reinstall never overwrites the real originals.
