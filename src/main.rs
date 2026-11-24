@@ -32,6 +32,9 @@ const DEFAULT_SERVERS: &[(&str, &str)] = &[
     ("ptbtime1.ptb.de", "ptb"),
     ("nts.time.nl", "sidn"),
     ("virginia.time.system76.com", "system76"),
+    ("nts.meta.com", "meta"),
+    ("ntp1.wiktel.com", "wiktel"),
+    ("time1.mbix.ca", "mbix"),
 ];
 
 struct Config {
@@ -858,9 +861,12 @@ mod tests {
             );
         }
         assert!(parse_args(["--servers".into(), "a=x,b=x,c=y".into()]).is_err());
-        for value in ["0", "6"] {
+        let operators: HashSet<_> = DEFAULT_SERVERS.iter().map(|&(_, group)| group).collect();
+        let too_many = (operators.len() + 1).to_string();
+        for value in ["0", too_many.as_str()] {
             assert!(parse_args(["--min-agree".into(), value.into()]).is_err());
         }
+        assert!(parse_args(["--min-agree".into(), operators.len().to_string()]).is_ok());
         for value in ["0", "9"] {
             assert!(parse_args(["--samples".into(), value.into()]).is_err());
         }
